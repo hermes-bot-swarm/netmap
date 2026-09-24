@@ -130,6 +130,7 @@ _BUILTIN_OUI = {
     "00:1d:7e": "Cisco", "00:23:04": "Cisco", "f8:66:f2": "D-Link",
     "00:05:69": "VMware", "00:1c:14": "VMware", "d8:bb:c1": "AzureWave",
     "00:e0:4c": "Realtek", "52:11:22": "Locally administered",
+    "00:00:17": "Oracle", "02:00:17": "Oracle (local)",
     "02:42:ac": "Docker", "02:11:32": "Locally administered",
 }
 
@@ -356,10 +357,12 @@ def read_neighbor_table():
             with open("/proc/net/arp") as f:
                 for line in f.readlines()[1:]:
                     p = line.split()
-                    if len(p) >= 6:
+                    # IP  HW-type  Flags  HW-address  Mask  Device
+                    # Flags 0x0 = incomplete resolution -> zero MAC, not a real host
+                    if len(p) >= 6 and p[2] != "0x0":
                         ip = safe_ip(p[0])
                         mac = mac_norm(p[3])
-                        if ip and mac:
+                        if ip and mac and mac != "00:00:00:00:00:00":
                             table[ip] = mac
         except Exception:
             pass
@@ -369,7 +372,7 @@ def read_neighbor_table():
             for n in json.loads(js):
                 ip = safe_ip(n.get("dst"))
                 mac = mac_norm(n.get("lladdr") or "")
-                if ip and mac:
+                if ip and mac and mac != "00:00:00:00:00:00":
                     table[ip] = mac
         except Exception:
             pass
@@ -382,7 +385,14 @@ def read_neighbor_table():
     if sysname == "Windows":
         out = run(["arp", "-a"], 10)
         for m in re.finditer(r"(\d+\.\d+\.\d+\.\d+)\s+([0-9A-Fa-f]{2}(-[0-9A-Fa-f]{2}){5})", out):
-            table[safe_ip(m.group(1))] = mac_norm(m.group(2))
+            mac = mac_norm(m.group(2))
+            if mac and mac != "00:00:00:00:00:00":
+                table[safe_ip(m.group(1))] = mac
+
+    # drop link-local (169.254/16): infrastructure aliases (e.g. cloud metadata
+    # services), not real LAN members
+    for ll in [ip for ip in table if ip.startswith("169.254.")]:
+        del table[ll]
 
     return table
 
@@ -546,6 +556,10 @@ def scan_lan(ipv4, prefix, ifname, deep_ports, do_trace):
     # keep prior knowledge too
     for ip, mac in neigh_before.items():
         found.setdefault(ip, mac)
+    # hosts that answered ping but stayed out of the neighbor table still count
+    for ip in alive:
+        if is_private_v4(ip) and ip != ipv4 and ip != bc and ip != net_ip:
+            found.setdefault(ip, None)
 
     devices = []
     for ip in sorted(found, key=lambda x: tuple(int(o) for o in x.split("."))):
@@ -556,7 +570,7 @@ def scan_lan(ipv4, prefix, ifname, deep_ports, do_trace):
             "mac": mac,
             "vendor": vendor_for(mac),
             "hostname": hostname_for(ip),
-            "alive": ip in neigh and neigh.get(ip) == mac,
+            "alive": (ip in neigh) or (ip in alive),
             "open_ports": None,
         }
         devices.append(dev)
@@ -773,7 +787,7 @@ def build_payload(args):
 def submit(server, record, dry=False):
     data = json.dumps(record).encode()
     if dry:
-        print(json.dumps(record, indent=2))
+        sys.stdout.write(json.dumps(record, indent=2) + "\n")
         return 0
     url = server.rstrip("/") + "/api/v1/scan"
     req = urllib.request.Request(url, data=data, method="POST",
@@ -830,9 +844,10 @@ def one_cycle(args):
 
 def main(argv=None):
     args = parse_args(argv)
-    print("netmap agent v%s — scans YOUR networks and contributes them to the "
-          "public map at %s" % (__version__, args.server))
-    print("Only run this on networks you own or have permission to scan.\n")
+    # banner goes to stderr so --dry-run stdout stays clean, pipeable JSON
+    log("netmap agent v%s — scans YOUR networks and contributes them to the "
+        "public map at %s" % (__version__, args.server))
+    log("Only run this on networks you own or have permission to scan.")
     while True:
         try:
             one_cycle(args)
