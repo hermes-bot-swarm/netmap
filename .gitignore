@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.db
+*.db-wal
+*.db-shm
+oui.txt
+.venv/
+venv/
+nohup.out
+*.log

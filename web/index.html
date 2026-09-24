@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>netmap — the crowdsourced map of the internet</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  html,body{margin:0;padding:0;height:100%;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#0b0e14;color:#d7dde8}
+  #map{position:absolute;inset:0}
+  .panel{position:absolute;z-index:1000;background:rgba(11,14,20,.92);border:1px solid #263043;border-radius:10px;backdrop-filter:blur(6px)}
+  #topbar{top:10px;left:50%;transform:translateX(-50%);padding:8px 14px;display:flex;gap:14px;align-items:center;white-space:nowrap}
+  #topbar h1{font-size:15px;margin:0;font-weight:600;letter-spacing:.4px}
+  #topbar .stat{font-size:12px;color:#8fa3c0}
+  #topbar .stat b{color:#e8eef7}
+  #search{background:#131a26;border:1px solid #263043;color:#d7dde8;border-radius:6px;padding:4px 8px;font-size:12px;width:180px}
+  #legend{bottom:18px;left:10px;padding:10px 12px;font-size:12px;line-height:1.7}
+  #legend .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:-1px}
+  #detail{top:10px;right:10px;width:360px;max-height:calc(100% - 90px);overflow:auto;padding:12px 14px;display:none}
+  #detail h2{font-size:14px;margin:0 0 2px}
+  #detail .sub{font-size:11px;color:#8fa3c0;margin-bottom:8px}
+  #detail table{width:100%;border-collapse:collapse;font-size:11.5px}
+  #detail td,#detail th{padding:3px 5px;border-bottom:1px solid #1b2333;text-align:left;white-space:nowrap}
+  #detail th{color:#8fa3c0;font-weight:500}
+  #detail .close{float:right;cursor:pointer;color:#8fa3c0;border:none;background:none;font-size:15px}
+  #detail .badge{display:inline-block;background:#1c2739;color:#9db4d6;border-radius:4px;padding:0 5px;font-size:10px;margin-left:4px}
+  .leaflet-popup-content{font-size:12px}
+  .leaflet-popup-content b{color:#1a1a2e}
+  a{color:#7fb3ff}
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<div class="panel" id="topbar">
+  <h1>netmap</h1>
+  <span class="stat" id="stats">loading…</span>
+  <input id="search" placeholder="lookup IP or netkey ↵">
+</div>
+
+<div class="panel" id="legend">
+  <span class="dot" style="background:#ffd166"></span>networks (LANs) — size = devices seen<br>
+  <span class="dot" style="background:#4cc9f0"></span>traceroute hops (public infra)<br>
+  <span style="color:#f72585">▬</span> ISP path edges (adjacent traceroute hops)
+</div>
+
+<div class="panel" id="detail">
+  <button class="close" onclick="document.getElementById('detail').style.display='none'">✕</button>
+  <div id="detail-body"></div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const map = L.map('map', {worldCopyJump:true}).setView([30, 5], 2);
+L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+  maxZoom: 19,
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors, &copy; <a href="https://carto.com/attributions">CARTO</a> | netmap'
+}).addTo(map);
+
+const lyrNets  = L.layerGroup().addTo(map);
+const lyrHops  = L.layerGroup().addTo(map);
+const lyrEdges = L.layerGroup().addTo(map);
+L.control.layers(null, {
+  "Networks (LANs)": lyrNets,
+  "Traceroute hops": lyrHops,
+  "ISP path edges": lyrEdges
+}, {collapsed:false}).addTo(map);
+
+const esc = s => String(s==null?'':s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+let HOPPOS = {};   // ip -> [lat,lon]
+let NETIDX = {};   // netkey -> network record
+
+async function loadMap() {
+  try {
+    const data = await (await fetch('/api/v1/map')).json();
+    const st = data.stats || {};
+    document.getElementById('stats').innerHTML =
+      `<b>${st.scans??0}</b> scans · <b>${st.networks??0}</b> networks · ` +
+      `<b>${st.devices??0}</b> devices · <b>${st.edges??0}</b> edges` +
+      (st.last_scan ? ` · last ${esc(st.last_scan)}` : '');
+
+    lyrNets.clearLayers(); lyrHops.clearLayers(); lyrEdges.clearLayers();
+    HOPPOS = {}; NETIDX = {};
+
+    for (const h of data.hops || []) {
+      HOPPOS[h.ip] = [h.lat, h.lon];
+      L.circleMarker([h.lat, h.lon], {
+        radius: 3, color:'#4cc9f0', weight:1, fillColor:'#4cc9f0', fillOpacity:.75
+      }).bindPopup(
+        `<b>${esc(h.ip)}</b><br>${esc(h.city||'?')}, ${esc(h.country||'?')}` +
+        `<br>${esc(h.org||'')}${h.asn?`<br>AS${h.asn}`:''}`
+      ).addTo(lyrHops);
+    }
+    for (const [src,dst] of (data.edges||[]).map(e=>[e[0],e[1]])) {
+      const a=HOPPOS[src], b=HOPPOS[dst];
+      if (a && b) L.polyline([a,b], {color:'#f72585', weight:1.2, opacity:.45})
+        .bindTooltip(`${src} → ${dst}`).addTo(lyrEdges);
+    }
+    for (const n of data.networks || []) {
+      NETIDX[n.id] = n;
+      const m = L.circleMarker([n.lat,n.lon], {
+        radius: 5 + Math.min(14, Math.sqrt(n.devices||1)*2),
+        color:'#ffd166', weight:1.2, fillColor:'#ffd166', fillOpacity:.55
+      }).addTo(lyrNets);
+      m.bindPopup(
+        `<b>network ${esc(n.id)}</b><br>` +
+        `${esc(n.city||'?')}, ${esc(n.country||'?')}<br>` +
+        `public IP ${esc(n.ip||'?')}<br>` +
+        `devices seen: <b>${n.devices??'?'}</b>` +
+        (n.org?`<br>${esc(n.org)}`:'') +
+        `<br><a href="#" onclick="showNet('${esc(n.id)}');return false;">LAN details →</a>`
+      );
+      m.on('click', () => showNet(n.id));
+    }
+  } catch(e) { document.getElementById('stats').textContent = 'map load failed: '+e; }
+}
+
+async function showNet(netkey) {
+  const panel = document.getElementById('detail');
+  const body  = document.getElementById('detail-body');
+  panel.style.display = 'block';
+  body.innerHTML = 'loading…';
+  try {
+    const n = await (await fetch('/api/v1/network/'+encodeURIComponent(netkey))).json();
+    const meta = NETIDX[netkey] || {};
+    const rows = (n.devices||[]).map(d =>
+      `<tr><td>${esc(d.ipv4||d.ipv6||'?')}</td>` +
+      `<td>${esc(d.mac||'')}</td><td>${esc(d.vendor||'')}</td>` +
+      `<td>${esc(d.hostname||'')}</td>` +
+      `<td>${(d.open_ports||[]).length?d.open_ports.map(esc).join(','):''}</td></tr>`).join('');
+    body.innerHTML =
+      `<h2>LAN ${esc(netkey)}</h2>` +
+      `<div class="sub">${esc(meta.city||n.city||'')}, ${esc(meta.country||n.country||'')} · ` +
+      `gateway ${esc(n.gateway||'?')} ${esc((n.gateway_mac||''))} · last scan ${esc(n.discovered_at||'')}</div>` +
+      `<table><tr><th>host</th><th>MAC</th><th>vendor</th><th>name</th><th>ports</th></tr>${rows}</table>` +
+      `<div class="sub" style="margin-top:8px">${(n.devices||[]).length} devices · ` +
+      `${n.hosts_total??'?'} addresses probed</div>`;
+  } catch(e) { body.innerHTML = 'failed: '+e; }
+}
+
+document.getElementById('search').addEventListener('keydown', async e => {
+  if (e.key !== 'Enter') return;
+  const q = e.target.value.trim(); if (!q) return;
+  try {
+    const r = await (await fetch('/api/v1/lookup?ip='+encodeURIComponent(q))).json();
+    if (r.lat != null) { map.setView([r.lat, r.lon], 13);
+      if (r.kind==='network') showNet(r.identifier); }
+    else alert('not found: '+q);
+  } catch(err) { alert('lookup failed'); }
+});
+
+loadMap();
+setInterval(loadMap, 60000);
+</script>
+</body>
+</html>
